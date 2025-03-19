@@ -26,7 +26,7 @@ class PatchTransformer(nn.Module):
         mul_gau_std: Union[float, Tuple[float, float]] = 0.1,
         x_off_loc: Tuple[float, float] = [-0.25, 0.25],
         y_off_loc: Tuple[float, float] = [-0.25, 0.25],
-        dev: torch.device = torch.device("cuda:0"),
+        dev: torch.device = None,
     ):
         super(PatchTransformer, self).__init__()
         # convert to duplicated lists/tuples to unpack and send to np.random.uniform
@@ -38,7 +38,8 @@ class PatchTransformer(nn.Module):
         ), "Range must have 2 values"
         self.x_off_loc = x_off_loc
         self.y_off_loc = y_off_loc
-        self.dev = dev
+        # Default to cuda:0 if no device is specified
+        self.dev = dev if dev is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.min_contrast = 0.8
         self.max_contrast = 1.2
         self.min_brightness = -0.1
@@ -46,9 +47,9 @@ class PatchTransformer(nn.Module):
         self.noise_factor = 0.10
         self.minangle = -20 / 180 * math.pi
         self.maxangle = 20 / 180 * math.pi
-        self.medianpooler = MedianPool2d(kernel_size=7, same=True)
+        self.medianpooler = MedianPool2d(kernel_size=7, same=True).to(self.dev)
 
-        self.tensor = torch.FloatTensor if "cpu" in str(dev) else torch.cuda.FloatTensor
+        self.tensor = torch.FloatTensor if "cpu" in str(self.dev) else torch.cuda.FloatTensor
 
     def forward(
         self, adv_patch, lab_batch, model_in_sz, use_mul_add_gau=True, do_transforms=True, do_rotate=True, rand_loc=True
@@ -66,8 +67,10 @@ class PatchTransformer(nn.Module):
             adv_patch = adv_patch * mul_gau + add_gau
         adv_patch = self.medianpooler(adv_patch.unsqueeze(0))
         m_h, m_w = model_in_sz
-        # Determine size of padding
-        pad = (m_w - adv_patch.size(-1)) / 2
+        # Determine size of padding - for a rectangular image, we need different padding for width vs height
+        pad_w = (m_w - adv_patch.size(-1)) / 2
+        pad_h = (m_h - adv_patch.size(-2)) / 2
+        
         # Make a batch of patches
         adv_patch = adv_patch.unsqueeze(0)
         adv_batch = adv_patch.expand(
@@ -78,17 +81,17 @@ class PatchTransformer(nn.Module):
         # Contrast, brightness and noise transforms
         if do_transforms:
             # Create random contrast tensor
-            contrast = self.tensor(batch_size).uniform_(self.min_contrast, self.max_contrast)
+            contrast = torch.empty(batch_size, device=self.dev).uniform_(self.min_contrast, self.max_contrast)
             contrast = contrast.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
             contrast = contrast.expand(-1, -1, adv_batch.size(-3), adv_batch.size(-2), adv_batch.size(-1))
 
             # Create random brightness tensor
-            brightness = self.tensor(batch_size).uniform_(self.min_brightness, self.max_brightness)
+            brightness = torch.empty(batch_size, device=self.dev).uniform_(self.min_brightness, self.max_brightness)
             brightness = brightness.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
             brightness = brightness.expand(-1, -1, adv_batch.size(-3), adv_batch.size(-2), adv_batch.size(-1))
 
             # Create random noise tensor
-            noise = self.tensor(adv_batch.size()).uniform_(-1, 1) * self.noise_factor
+            noise = torch.empty(adv_batch.size(), device=self.dev).uniform_(-1, 1) * self.noise_factor
 
             # Apply contrast/brightness/noise, clamp
             adv_batch = adv_batch * contrast + brightness + noise
@@ -103,40 +106,42 @@ class PatchTransformer(nn.Module):
         cls_mask = cls_mask.unsqueeze(-1)
         # [bsize, max_bbox_labels, pchannel, pheight, pwidth]
         cls_mask = cls_mask.expand(-1, -1, -1, -1, adv_batch.size(4))
-        msk_batch = self.tensor(cls_mask.size()).fill_(1)
+        msk_batch = torch.ones(cls_mask.size(), device=self.dev)
 
-        # Pad patch and mask to image dimensions
-        patch_pad = nn.ConstantPad2d((int(pad + 0.5), int(pad), int(pad + 0.5), int(pad)), 0)
+        # Pad patch and mask to image dimensions for rectangular images
+        patch_pad = nn.ConstantPad2d((int(pad_w + 0.5), int(pad_w), int(pad_h + 0.5), int(pad_h)), 0)
         adv_batch = patch_pad(adv_batch)
         msk_batch = patch_pad(msk_batch)
 
         # Rotation and rescaling transforms
         anglesize = lab_batch.size(0) * lab_batch.size(1)
         if do_rotate:
-            angle = self.tensor(anglesize).uniform_(self.minangle, self.maxangle)
+            angle = torch.empty(anglesize, device=self.dev).uniform_(self.minangle, self.maxangle)
         else:
-            angle = self.tensor(anglesize).fill_(0)
+            angle = torch.zeros(anglesize, device=self.dev)
 
         # Resizes and rotates
         current_patch_size = adv_patch.size(-1)
-        lab_batch_scaled = self.tensor(lab_batch.size()).fill_(0)
-        lab_batch_scaled[:, :, 1] = lab_batch[:, :, 1] * m_w
-        lab_batch_scaled[:, :, 2] = lab_batch[:, :, 2] * m_w
-        lab_batch_scaled[:, :, 3] = lab_batch[:, :, 3] * m_w
-        lab_batch_scaled[:, :, 4] = lab_batch[:, :, 4] * m_w
+        lab_batch_scaled = torch.zeros(lab_batch.size(), device=self.dev)
+        lab_batch_scaled[:, :, 1] = lab_batch[:, :, 1] * m_w  # x center
+        lab_batch_scaled[:, :, 2] = lab_batch[:, :, 2] * m_h  # y center
+        lab_batch_scaled[:, :, 3] = lab_batch[:, :, 3] * m_w  # width
+        lab_batch_scaled[:, :, 4] = lab_batch[:, :, 4] * m_h  # height
+        
         tsize = np.random.uniform(*self.t_size_frac)
-        target_size = torch.sqrt(
-            ((lab_batch_scaled[:, :, 3].mul(tsize)) ** 2) + ((lab_batch_scaled[:, :, 4].mul(tsize)) ** 2)
-        )
+        # For each bounding box, calculate appropriate patch size based on box dimensions
+        w_size = lab_batch_scaled[:, :, 3].mul(tsize)
+        h_size = lab_batch_scaled[:, :, 4].mul(tsize)
+        target_size = torch.sqrt(w_size**2 + h_size**2)
 
         target_x = lab_batch[:, :, 1].view(np.prod(batch_size))
         target_y = lab_batch[:, :, 2].view(np.prod(batch_size))
         targetoff_x = lab_batch[:, :, 3].view(np.prod(batch_size))
         targetoff_y = lab_batch[:, :, 4].view(np.prod(batch_size))
         if rand_loc:
-            off_x = targetoff_x * (self.tensor(targetoff_x.size()).uniform_(*self.x_off_loc))
+            off_x = targetoff_x * torch.empty(targetoff_x.size(), device=self.dev).uniform_(*self.x_off_loc)
             target_x = target_x + off_x
-            off_y = targetoff_y * (self.tensor(targetoff_y.size()).uniform_(*self.x_off_loc))
+            off_y = targetoff_y * torch.empty(targetoff_y.size(), device=self.dev).uniform_(*self.y_off_loc)
             target_y = target_y + off_y
         scale = target_size / current_patch_size
         scale = scale.view(anglesize)
@@ -145,6 +150,7 @@ class PatchTransformer(nn.Module):
         adv_batch = adv_batch.view(s[0] * s[1], s[2], s[3], s[4])
         msk_batch = msk_batch.view(s[0] * s[1], s[2], s[3], s[4])
 
+        # Calculate grid coordinates properly for rectangular images
         tx = (-target_x + 0.5) * 2
         ty = (-target_y + 0.5) * 2
         sin = torch.sin(angle)
@@ -152,7 +158,7 @@ class PatchTransformer(nn.Module):
 
         # Theta = rotation/rescale matrix
         # Theta = input batch of affine matrices with shape (N×2×3) for 2D or (N×3×4) for 3D
-        theta = self.tensor(anglesize, 2, 3).fill_(0)
+        theta = torch.zeros(anglesize, 2, 3, device=self.dev)
         theta[:, 0, 0] = cos / scale
         theta[:, 0, 1] = sin / scale
         theta[:, 0, 2] = tx * cos / scale + ty * sin / scale
@@ -160,9 +166,9 @@ class PatchTransformer(nn.Module):
         theta[:, 1, 1] = cos / scale
         theta[:, 1, 2] = -tx * sin / scale + ty * cos / scale
 
-        grid = F.affine_grid(theta, adv_batch.shape)
-        adv_batch_t = F.grid_sample(adv_batch, grid)
-        msk_batch_t = F.grid_sample(msk_batch, grid)
+        grid = F.affine_grid(theta, adv_batch.shape, align_corners=True)  # Use align_corners=True for consistent results
+        adv_batch_t = F.grid_sample(adv_batch, grid, align_corners=True)
+        msk_batch_t = F.grid_sample(msk_batch, grid, align_corners=True)
 
         adv_batch_t = adv_batch_t.view(s[0], s[1], s[2], s[3], s[4])
         msk_batch_t = msk_batch_t.view(s[0], s[1], s[2], s[3], s[4])
@@ -186,9 +192,10 @@ class PatchApplier(nn.Module):
             B = background (image, or img_batch)
     """
 
-    def __init__(self, patch_alpha: float = 1):
+    def __init__(self, patch_alpha: float = 1, dev: torch.device = None):
         super(PatchApplier, self).__init__()
         self.patch_alpha = patch_alpha
+        self.dev = dev if dev is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     def forward(self, img_batch, adv_batch):
         advs = torch.unbind(adv_batch, 1)

@@ -19,7 +19,7 @@ from easydict import EasyDict as edict
 from PIL import Image
 from tensorboard import program
 from torch import autograd, optim
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms as T
 from tqdm import tqdm
@@ -224,7 +224,7 @@ class PatchTrainer:
                         img = T.ToPILImage()(img.detach().cpu())
                         img.save(osp.join(self.cfg.log_dir, "train_patch_applied_imgs", f"b_{i_batch}.jpg"))
 
-                    with autocast() if self.cfg.use_amp else nullcontext():
+                    with autocast('cuda') if self.cfg.use_amp else nullcontext():
                         output = self.model(p_img_batch)[0]
                         max_prob = self.prob_extractor(output)
                         sal = self.sal_loss(adv_patch) if self.cfg.sal_mult != 0 else zero_tensor
